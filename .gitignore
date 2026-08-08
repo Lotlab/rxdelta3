@@ -1,0 +1,7 @@
+/target
+/tests/examples
+.opencode/
+openspec/
+*.obj
+__pycache__/
+/opencode.json

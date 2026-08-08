@@ -1,0 +1,11 @@
+LIBRARY XDelta3WrapFactory
+EXPORTS
+    GenerateDeltaDir            = _GenerateDeltaDir@16                @1
+    GenerateDeltaDirCustomDiff  = _GenerateDeltaDirCustomDiff@32      @2
+    GenerateDeltaFile           = _GenerateDeltaFile@12               @3
+    GetClassObj                 = _GetClassObj@8                      @4
+    MergeDir                    = _MergeDir@16                        @5
+    MergeDirCustomDiff          = _MergeDirCustomDiff@20              @6
+    MergeDirCustomDiffV2        = _MergeDirCustomDiffV2@24            @7
+    MergeFile                   = _MergeFile@12                       @8
+    ReleaseClassObj             = _ReleaseClassObj@8                  @9

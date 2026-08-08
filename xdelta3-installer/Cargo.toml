@@ -1,0 +1,9 @@
+[package]
+name = "xdelta3-installer"
+version = "0.1.0"
+edition = "2021"
+description = "Standalone installer/rollback tool for the xdelta3-wrap launcher DLL"
+
+[[bin]]
+name = "xdelta3-installer"
+path = "src/main.rs"
