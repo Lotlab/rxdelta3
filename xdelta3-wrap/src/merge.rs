@@ -353,6 +353,16 @@ const APPLY_OPTS: ApplyOptions = ApplyOptions {
     idempotent_skip: true,
 };
 
+/// Same as [`APPLY_OPTS`] but without the idempotent source-hash pre-read.
+/// The wrapper only uses this for sources known to be the old version that
+/// will always be patched, so the skip check can never fire and only costs a
+/// full extra read of the source. Mirrors `--no-skip-check` on the CLI.
+const APPLY_OPTS_NO_SKIP: ApplyOptions = ApplyOptions {
+    verify_checksums: true,
+    max_window_size: rxdelta::DEFAULT_MAX_WINDOW,
+    idempotent_skip: false,
+};
+
 /// Decode `delta` against `src` writing to `dst`, following `MergeFileInternal`.
 /// - If `src == dst` (case-insensitive): apply in place, rewriting only the
 ///   changed window slots (pure-copy windows are skipped). Falls back to the
@@ -472,7 +482,7 @@ fn in_place_apply(src: &Path, delta: &Path, expected_md5: Option<&str>) -> bool 
         let outcome = rxdelta::apply_paths_in_place_verified(
             src,
             delta,
-            &APPLY_OPTS,
+            &APPLY_OPTS_NO_SKIP,
             rxdelta::ChecksumAlgo::Md5,
             None,
             Some(&expect_after),
@@ -599,7 +609,8 @@ fn subprocess_decode(
         .arg(src)
         .arg(delta)
         .arg("-o")
-        .arg(dst);
+        .arg(dst)
+        .arg("--stats");
     if let Some(md5) = expected_md5 {
         // Verify output via --expect-after, but skip the idempotent source-hash
         // pre-read: the wrapper only calls this for old sources that always get
@@ -609,7 +620,7 @@ fn subprocess_decode(
     }
     logln!("[subproc] {}", cmd_debug(&cmd));
     let sw = Stopwatch::start();
-    match cmd.status() {
+    match run_subprocess(&mut cmd) {
         Ok(st) => {
             let code = st.code().unwrap_or(-1);
             logln!("[timing] subproc decode exit={} ({:.1}ms)", code, sw.ms());
@@ -648,7 +659,8 @@ fn subprocess_decode_in_place(src: &Path, delta: &Path, expected_md5: Option<&st
         .arg("--in-place")
         .arg("-s")
         .arg(src)
-        .arg(delta);
+        .arg(delta)
+        .arg("--stats");
     if let Some(md5) = expected_md5 {
         // Skip the idempotent source-hash pre-read: same reasoning as
         // `subprocess_decode` — the wrapper only calls this for old sources
@@ -660,7 +672,7 @@ fn subprocess_decode_in_place(src: &Path, delta: &Path, expected_md5: Option<&st
     }
     logln!("[subproc] {}", cmd_debug(&cmd));
     let sw = Stopwatch::start();
-    match cmd.status() {
+    match run_subprocess(&mut cmd) {
         Ok(st) => {
             let code = st.code().unwrap_or(-1);
             logln!("[timing] subproc in-place exit={} ({:.1}ms)", code, sw.ms());
@@ -683,6 +695,21 @@ fn subprocess_decode_in_place(src: &Path, delta: &Path, expected_md5: Option<&st
             false
         }
     }
+}
+
+/// Run a child command capturing its stdout/stderr, forward every captured
+/// line into the wrapper log, then return the exit status. The host is a GUI
+/// process with no attached console, so without this the `--stats` output of
+/// the 64-bit apply subprocess would be lost.
+fn run_subprocess(cmd: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
+    let out = cmd.output()?;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        logln!("[subproc:out] {line}");
+    }
+    for line in String::from_utf8_lossy(&out.stderr).lines() {
+        logln!("[subproc:err] {line}");
+    }
+    Ok(out.status)
 }
 
 fn cmd_debug(cmd: &std::process::Command) -> String {
