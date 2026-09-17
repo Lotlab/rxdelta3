@@ -650,7 +650,13 @@ fn subprocess_decode_in_place(src: &Path, delta: &Path, expected_md5: Option<&st
         .arg(src)
         .arg(delta);
     if let Some(md5) = expected_md5 {
-        cmd.arg("--expect-after").arg(md5);
+        // Skip the idempotent source-hash pre-read: same reasoning as
+        // `subprocess_decode` — the wrapper only calls this for old sources
+        // that always get patched, so the skip check would never fire and
+        // only costs a full extra read of a multi-GB source file. (Without
+        // this, 0.2's verified in-place path hashes source + output = two
+        // full passes instead of one.)
+        cmd.arg("--no-skip-check").arg("--expect-after").arg(md5);
     }
     logln!("[subproc] {}", cmd_debug(&cmd));
     let sw = Stopwatch::start();

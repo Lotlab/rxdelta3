@@ -10,12 +10,13 @@
 //! Crash safety for the write-back phase relies on a small on-disk journal:
 //! before the source is touched, the original bytes of every range that will
 //! be overwritten or truncated are streamed into
-//! `<source>.xdelta-journal.tmp` and fsync'd. If a write fails (I/O error,
+//! `<source>.xdelta-journal.tmp` and fsync'd (the only fsync in the apply;
+//! the source itself is flushed, not synced). If a write fails (I/O error,
 //! process kill, power loss) the journal replays those ranges and restores
 //! the original length. A stale journal left by a crashed run is replayed
 //! automatically at the start of the next apply, and can also be replayed
 //! manually with [`recover_in_place_journal`]. The journal is deleted once
-//! the source has been fully written and synced.
+//! the source has been fully written and flushed.
 //!
 //! Window decoding is shared with `decode_one_window`; this
 //! module only adds the layout scan, pure-copy detection, two-phase write-back
@@ -326,7 +327,7 @@ fn journal_path(source: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn write_u64(f: &mut File, v: u64) -> Result<()> {
+fn write_u64(f: &mut impl Write, v: u64) -> Result<()> {
     f.write_all(&v.to_le_bytes()).map_err(Error::from)
 }
 
@@ -353,11 +354,12 @@ fn read_u64(r: &mut impl Read) -> std::io::Result<Option<u64>> {
 /// Records that fall completely past EOF (file-growth region) carry no
 /// original data and are skipped; the rollback truncation restores those.
 fn append_journal_record(
-    journal: &mut File,
+    journal: &mut impl Write,
     reader: &mut File,
     offset: u64,
     len: u64,
     orig_len: u64,
+    buf: &mut [u8],
 ) -> Result<()> {
     let start = offset.min(orig_len);
     let end = offset.saturating_add(len).min(orig_len);
@@ -368,10 +370,9 @@ fn append_journal_record(
     write_u64(journal, start)?;
     write_u64(journal, span)?;
     reader.seek(SeekFrom::Start(start))?;
-    let mut buf = vec![0u8; JOURNAL_CHUNK as usize];
     let mut remaining = span;
     while remaining > 0 {
-        let n = remaining.min(JOURNAL_CHUNK) as usize;
+        let n = remaining.min(buf.len() as u64) as usize;
         reader.read_exact(&mut buf[..n])?;
         journal.write_all(&buf[..n])?;
         remaining -= n as u64;
@@ -406,6 +407,7 @@ pub fn recover_in_place_journal(source: &Path) -> Result<bool> {
         let mut target = OpenOptions::new().read(true).write(true).open(source)?;
         // Replay every complete record; a torn tail (crash mid-journal-write)
         // simply stops the loop — the source was untouched in that case.
+        let mut buf = vec![0u8; JOURNAL_CHUNK as usize];
         while let Some(off) = read_u64(&mut journal)? {
             let len = match read_u64(&mut journal)? {
                 Some(l) => l,
@@ -413,7 +415,6 @@ pub fn recover_in_place_journal(source: &Path) -> Result<bool> {
             };
             let mut remaining = len;
             target.seek(SeekFrom::Start(off))?;
-            let mut buf = vec![0u8; JOURNAL_CHUNK as usize];
             while remaining > 0 {
                 let n = remaining.min(JOURNAL_CHUNK) as usize;
                 let mut got = 0usize;
@@ -464,9 +465,15 @@ fn write_journal(
 ) -> Result<PathBuf> {
     let path = journal_path(source);
     let mut reader = File::open(source)?;
-    let mut journal = File::create(&path)?;
+    // Buffer the journal stream: record headers are 16 bytes each, and
+    // without buffering every one of them is its own syscall.
+    let file = File::create(&path)?;
+    let mut journal = BufWriter::with_capacity(JOURNAL_CHUNK as usize, file);
     journal.write_all(&JOURNAL_MAGIC)?;
     write_u64(&mut journal, orig_len)?;
+    // One scratch buffer reused across all records (was one 1 MiB
+    // allocation per record before).
+    let mut buf = vec![0u8; JOURNAL_CHUNK as usize];
     for (off, bytes) in changed {
         append_journal_record(
             &mut journal,
@@ -474,6 +481,7 @@ fn write_journal(
             *off,
             bytes.len() as u64,
             orig_len,
+            &mut buf,
         )?;
     }
     // Shrinking truncates `[target_len, orig_len)` away without ever
@@ -482,20 +490,28 @@ fn write_journal(
         let mut off = target_len;
         while off < orig_len {
             let n = (orig_len - off).min(JOURNAL_CHUNK);
-            append_journal_record(&mut journal, &mut reader, off, n, orig_len)?;
+            append_journal_record(&mut journal, &mut reader, off, n, orig_len, &mut buf)?;
             off += n;
         }
     }
     journal.flush()?;
-    journal.sync_all()?;
+    journal.get_mut().sync_all()?;
     Ok(path)
 }
 
 /// Phase 2 of the in-place apply: persist the original blocks to the journal,
-/// fsync it, then resize and overwrite the changed slots. Any failure after
-/// the journal is durable triggers a rollback replay before the error is
+/// fsync it, then resize and overwrite the changed slots. Any failure
+/// detected while mutating triggers a rollback replay before the error is
 /// returned, so the source keeps either its old or its new content — never a
 /// torn mix.
+///
+/// Single-sync design: only the journal is fsync'd, the source itself is
+/// flushed but not synced. The journal fsync is the load-bearing one — it is
+/// what makes rollback possible after a crash mid-mutate. Skipping the source
+/// sync narrows the post-success power-loss window to "stale (old) file with
+/// no journal left", which the caller heals by re-applying (the output hash
+/// check will fail and the delta is re-applied from the intact old content);
+/// a runtime write failure still rolls back exactly as before.
 fn commit_changed_slots(source: &Path, target_len: u64, changed: &[(u64, Vec<u8>)]) -> Result<()> {
     let orig_len = std::fs::metadata(source)?.len();
     if changed.is_empty() && orig_len == target_len {
@@ -519,7 +535,6 @@ fn commit_changed_slots(source: &Path, target_len: u64, changed: &[(u64, Vec<u8>
             f.set_len(target_len)?;
         }
         f.flush()?;
-        f.sync_all()?;
         Ok(())
     })();
     match mutate {
