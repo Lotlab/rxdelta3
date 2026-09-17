@@ -20,8 +20,8 @@
 //!
 //! Window decoding is shared with `decode_one_window`; this
 //! module only adds the layout scan, pure-copy detection, two-phase write-back
-//! with journal rollback, the verified (`expect_before`/`expect_after`)
-//! pre-checks and the temp-rename threshold fallback.
+//! with journal rollback, the verified (`expect_before` pre-check /
+//! `expect_after` post-check) checks and the temp-rename threshold fallback.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -587,11 +587,11 @@ pub enum InPlaceOutcome {
 
 /// Verified in-place apply using [`DEFAULT_IN_PLACE_THRESHOLD`].
 ///
-/// Unlike the plain apply, `expect_after` is checked *before* the source is
-/// touched: the output hash is reconstructed from the decoded windows plus
-/// the untouched source bytes, so a mismatch fails with the file still
-/// byte-identical to the original (no journal replay needed). Write-phase
-/// I/O failures still roll back via the journal (see [`commit_changed_slots`]).
+/// `expect_before` and the idempotent skip are checked before the source is
+/// touched. `expect_after` is verified AFTER the write-back with a buffered
+/// sequential read; a mismatch reports failure with the patched file left in
+/// place (the legacy post-verify contract). Write-phase I/O failures still
+/// roll back via the journal (see [`commit_changed_slots`]).
 pub fn apply_paths_in_place_verified(
     source: &Path,
     delta: &Path,
@@ -609,6 +609,23 @@ pub fn apply_paths_in_place_verified(
         expect_after,
         DEFAULT_IN_PLACE_THRESHOLD,
     )
+}
+
+/// Hash a file with a 1 MiB buffered sequential read. Used for the post-write
+/// output check: it is measurably faster than hashing the same bytes window by
+/// window out of a source mmap, especially when the data is page-cached.
+fn hash_file_buffered(path: &Path, algo: ChecksumAlgo) -> Result<Box<[u8]>> {
+    let mut h = algo.instantiate();
+    let mut f = std::io::BufReader::with_capacity(1 << 20, File::open(path)?);
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.digest())
 }
 
 /// Verified in-place apply with an explicit cap on total changed-window bytes.
@@ -633,53 +650,47 @@ pub fn apply_paths_in_place_verified_with_threshold(
         return apply_via_temp_verified(source, delta, opts, algo, expect_before, expect_after);
     }
 
+    // Source-side pre-checks (`expect_before` and the idempotent skip) still
+    // run before any write, so an already-patched source returns without
+    // decoding a single window. The output hash is no longer reconstructed
+    // before the write: hashing every window out of the source mmap is
+    // measurably slower than a buffered sequential read, so it is checked
+    // AFTER the write-back (Phase 3) — the legacy post-verify contract. Crash
+    // safety comes from the journal, not from the pre-write check.
+    let hash_needed = expect_before.is_some()
+        || (opts.idempotent_skip
+            && expect_after.is_some()
+            && std::fs::metadata(source)?.len() == layout.target_len);
+    let source_hash: Option<Box<[u8]>> = if hash_needed {
+        Some(hash_file_buffered(source, algo)?)
+    } else {
+        None
+    };
+
+    if let (Some(src), Some(after)) = (&source_hash, expect_after)
+        && opts.idempotent_skip
+        && src.as_ref() == after
+    {
+        return Ok(InPlaceOutcome::Skipped {
+            source_checksum: src.clone(),
+        });
+    }
+
+    if let (Some(src), Some(before)) = (&source_hash, expect_before)
+        && src.as_ref() != before
+    {
+        return Err(Error::FileChecksumMismatch {
+            phase: "source",
+            algo: algo.name(),
+            expected: crate::encode_hex(before),
+            actual: crate::encode_hex(src),
+        });
+    }
+
     // Phase 1: decode every changed window while the source is untouched.
-    // The source hash (skip / `expect_before` checks) runs BEFORE any decode
-    // so an already-patched source returns without decoding a single window.
-    // The output hash is accumulated INLINE in the same decode loop — each
-    // window is hashed the moment it is produced — instead of a second walk
-    // over the decoded buffers. Either way nothing is written before both
-    // hashes are compared.
     let changed = {
         let src_map = MappedFile::open(source)?;
         let src_bytes = src_map.as_bytes();
-
-        // Source hash: feeds the `expect_before` check and the idempotent
-        // skip check against `expect_after`. A source whose length differs
-        // from the target provably cannot be skipped, so skip that hashing
-        // pass (mirrors `apply_paths_verified`).
-        let hash_needed = expect_before.is_some()
-            || (opts.idempotent_skip
-                && expect_after.is_some()
-                && src_bytes.len() as u64 == layout.target_len);
-        let source_hash: Option<Box<[u8]>> = if hash_needed {
-            let mut h = algo.instantiate();
-            h.update(src_bytes);
-            Some(h.digest())
-        } else {
-            None
-        };
-
-        if let (Some(src), Some(after)) = (&source_hash, expect_after)
-            && opts.idempotent_skip
-            && src.as_ref() == after
-        {
-            return Ok(InPlaceOutcome::Skipped {
-                source_checksum: src.clone(),
-            });
-        }
-
-        if let (Some(src), Some(before)) = (&source_hash, expect_before)
-            && src.as_ref() != before
-        {
-            return Err(Error::FileChecksumMismatch {
-                phase: "source",
-                algo: algo.name(),
-                expected: crate::encode_hex(before),
-                actual: crate::encode_hex(src),
-            });
-        }
-
         let mut target = Vec::new();
         let mut data_buf = Vec::new();
         let mut inst_buf = Vec::new();
@@ -687,20 +698,8 @@ pub fn apply_paths_in_place_verified_with_threshold(
         let mut secondary = SecondaryDecoder::new();
         let mut cache = AddrCache::new(layout.code_table.s_near, layout.code_table.s_same);
         let mut changed: Vec<(u64, Vec<u8>)> = Vec::with_capacity(layout.changed_windows);
-        let mut out_hash = expect_after.is_some().then(|| algo.instantiate());
         for wl in &layout.windows {
-            // Pure-copy slots hash straight from the source bytes (borrowed
-            // mmap slice, no decode and no copy); this also bounds-checks
-            // the source before anything is written.
             if wl.pure_copy {
-                if let Some(h) = out_hash.as_mut() {
-                    let (off, end) = window_source_range(
-                        wl.target_offset,
-                        wl.win.target_len as u64,
-                        src_bytes.len(),
-                    )?;
-                    h.update(&src_bytes[off..end]);
-                }
                 continue;
             }
             decode_one_window(
@@ -716,32 +715,31 @@ pub fn apply_paths_in_place_verified_with_threshold(
                 &mut addr_buf,
                 &mut target,
             )?;
-            // Hash the bytes while they are still hot from the decoder, then
-            // retain a copy for the Phase 2 write-back.
-            if let Some(h) = out_hash.as_mut() {
-                h.update(&target);
-            }
             changed.push((wl.target_offset, target.clone()));
         }
-        let output_digest = out_hash.map(|h| h.digest());
-
-        if let (Some(digest), Some(after)) = (&output_digest, expect_after)
-            && digest.as_ref() != after
-        {
-            return Err(Error::FileChecksumMismatch {
-                phase: "output",
-                algo: algo.name(),
-                expected: crate::encode_hex(after),
-                actual: crate::encode_hex(digest),
-            });
-        }
-
-        (changed, source_hash, output_digest)
+        changed
     };
-    let (changed, source_hash, output_digest) = changed;
 
     // Phase 2: journal + write-back with rollback on I/O failure.
     commit_changed_slots(source, layout.target_len, &changed)?;
+
+    // Phase 3: verify the output hash with a buffered sequential read. A
+    // mismatch reports failure with the patched file left in place.
+    let output_digest = match expect_after {
+        Some(after) => {
+            let digest = hash_file_buffered(source, algo)?;
+            if digest.as_ref() != after {
+                return Err(Error::FileChecksumMismatch {
+                    phase: "output",
+                    algo: algo.name(),
+                    expected: crate::encode_hex(after),
+                    actual: crate::encode_hex(&digest),
+                });
+            }
+            Some(digest)
+        }
+        None => None,
+    };
 
     Ok(InPlaceOutcome::Applied {
         stats: InPlaceStats {
@@ -756,22 +754,6 @@ pub fn apply_paths_in_place_verified_with_threshold(
             after: output_digest,
         },
     })
-}
-
-/// Bounds-checked source slice for a pure-copy window in the output pre-check.
-/// Pure-copy windows reproduce `[target_offset, target_offset + len)` from the
-/// source, so an out-of-range source is a corrupt input, not a writable one.
-fn window_source_range(target_offset: u64, len: u64, src_len: usize) -> Result<(usize, usize)> {
-    let off: usize = target_offset
-        .try_into()
-        .map_err(|_| Error::Format("source segment out of range"))?;
-    let end = off
-        .checked_add(len as usize)
-        .ok_or(Error::Format("source segment out of range"))?;
-    if end > src_len {
-        return Err(Error::Format("source segment out of range"));
-    }
-    Ok((off, end))
 }
 
 /// Threshold fallback for the verified apply: render to a temp file, verify
@@ -1179,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn verified_output_mismatch_leaves_source_untouched() {
+    fn verified_output_mismatch_patches_then_reports_failure() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src.dat");
         let dl = dir.path().join("patch.delta");
@@ -1201,8 +1183,9 @@ mod tests {
             Error::FileChecksumMismatch { phase, .. } => assert_eq!(phase, "output"),
             e => panic!("wrong error: {e}"),
         }
-        // Pre-write check: nothing was journaled, nothing was written.
-        assert_eq!(read_file(&src), source_bytes());
+        // Post-write check: the patch was applied, then the output hash was
+        // found to be wrong. The journal is consumed either way.
+        assert_eq!(read_file(&src), expected_output());
         assert!(!journal_for(&src).exists());
     }
 
