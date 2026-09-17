@@ -17,8 +17,8 @@ cargo build --release -p xdelta3-wrap --target "$TARGET_I686"
 cargo build --release -p rxdelta --bin xdelta --target "$TARGET_X64"
 
 # 3. Installer with both artifacts embedded (explicit env for reproducibility)
-XDELTA3_WRAP_DLL="target/$TARGET_I686/release/xdelta3_wrap.dll"
-XDELTA_EXE="target/$TARGET_X64/release/xdelta.exe"
+export XDELTA3_WRAP_DLL="target/$TARGET_I686/release/xdelta3_wrap.dll"
+export XDELTA_EXE="target/$TARGET_X64/release/xdelta.exe"
 
 cargo build --release -p xdelta3-installer --target "$TARGET_X64"
 
