@@ -457,6 +457,52 @@ fn in_place_apply(src: &Path, delta: &Path, expected_md5: Option<&str>) -> bool 
         return subprocess_decode_in_place(src, delta, expected_md5);
     }
     let asw = Stopwatch::start();
+    // With an expected MD5, verify inside the library: the output hash is
+    // checked before the source is touched, so a mismatch fails with the
+    // file still intact; write-phase I/O failures roll back via the journal.
+    // This also replaces the post-apply full-file MD5 re-read.
+    if let Some(md5) = expected_md5 {
+        let expect_after = match rxdelta::checksum::decode_hex(md5) {
+            Some(b) => b,
+            None => {
+                logln!("[error] in-place apply failed: invalid expected md5: {md5}");
+                return false;
+            }
+        };
+        let outcome = rxdelta::apply_paths_in_place_verified(
+            src,
+            delta,
+            &APPLY_OPTS,
+            rxdelta::ChecksumAlgo::Md5,
+            None,
+            Some(&expect_after),
+        );
+        logln!(
+            "[timing] in_place_apply core src={:.1}MB ({:.1}ms)",
+            src_size as f64 / 1048576.0,
+            asw.ms()
+        );
+        return match outcome {
+            Ok(rxdelta::InPlaceOutcome::Applied { stats, .. }) => {
+                logln!(
+                    "[in-place] windows={} written={} ({} bytes) skipped={} verified",
+                    stats.windows,
+                    stats.written_windows,
+                    stats.written_bytes,
+                    stats.skipped_windows
+                );
+                true
+            }
+            Ok(rxdelta::InPlaceOutcome::Skipped { .. }) => {
+                logln!("[in-place] skipped: already patched");
+                true
+            }
+            Err(e) => {
+                logln!("[error] in-place apply failed after {:.1}ms: {e}", asw.ms());
+                false
+            }
+        };
+    }
     let stats = match rxdelta::apply_paths_in_place(src, delta, &APPLY_OPTS) {
         Ok(s) => s,
         Err(e) => {
@@ -476,29 +522,7 @@ fn in_place_apply(src: &Path, delta: &Path, expected_md5: Option<&str>) -> bool 
         stats.written_bytes,
         stats.skipped_windows
     );
-
-    // Idempotent-skip semantics: if the source was already the target, the
-    // layout has no changed windows and nothing was written. In that case the
-    // source already matches `expected_md5` and post-verify passes.
-    if let Some(md5) = expected_md5 {
-        let vsw = Stopwatch::start();
-        let r = match file_md5_upper(src) {
-            Some(actual) if md5_hex_eq_ci(&actual, md5) => true,
-            Some(actual) => {
-                logln!(
-                    "[error] in-place output md5 mismatch: got {} want {}",
-                    actual,
-                    md5
-                );
-                false
-            }
-            None => false,
-        };
-        logln!("[timing] in_place_apply verify ({:.1}ms)", vsw.ms());
-        r
-    } else {
-        true
-    }
+    true
 }
 
 /// Decode one file: internal path via rxdelta, or external `merge_cb`.

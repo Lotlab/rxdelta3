@@ -192,6 +192,40 @@ fn run_apply_in_place(args: &ApplyArgs, opts: &rxdelta::ApplyOptions, cfg: &Chec
         }
     };
 
+    // With checksums configured, verify inside the library: `expect_after` is
+    // checked before the source is touched, so a mismatch fails with the file
+    // still intact (and write-phase I/O failures roll back via the journal).
+    if cfg.enabled {
+        let outcome = rxdelta::apply_paths_in_place_verified(
+            source,
+            &args.delta,
+            opts,
+            cfg.algo,
+            cfg.expect_before.as_deref(),
+            cfg.expect_after.as_deref(),
+        );
+        return match outcome {
+            Ok(rxdelta::InPlaceOutcome::Applied { stats, checksums }) => {
+                print_in_place_stats(args, &stats);
+                if let Some(b) = &checksums.before {
+                    eprintln!("{}-before: {}", cfg.algo.name(), rxdelta::encode_hex(b));
+                }
+                if let Some(a) = &checksums.after {
+                    eprintln!("{}-after: {}", cfg.algo.name(), rxdelta::encode_hex(a));
+                }
+                0
+            }
+            Ok(rxdelta::InPlaceOutcome::Skipped { .. }) => {
+                eprintln!("skipped: already patched");
+                0
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                1
+            }
+        };
+    }
+
     let stats = match rxdelta::apply_paths_in_place(source, &args.delta, opts) {
         Ok(s) => s,
         Err(e) => {
@@ -199,7 +233,11 @@ fn run_apply_in_place(args: &ApplyArgs, opts: &rxdelta::ApplyOptions, cfg: &Chec
             return 1;
         }
     };
+    print_in_place_stats(args, &stats);
+    0
+}
 
+fn print_in_place_stats(args: &ApplyArgs, stats: &rxdelta::InPlaceStats) {
     if args.stats {
         eprintln!(
             "windows: {}, written: {} ({} bytes), skipped: {}, target: {}",
@@ -210,39 +248,6 @@ fn run_apply_in_place(args: &ApplyArgs, opts: &rxdelta::ApplyOptions, cfg: &Chec
             stats.target_len
         );
     }
-
-    // Verify the resulting file against --expect-after, if given.
-    if let Some(expected) = &cfg.expect_after {
-        match checksum_file(source, cfg.algo) {
-            Ok(actual) => {
-                eprintln!("{}-after: {}", cfg.algo.name(), rxdelta::encode_hex(&actual));
-                if actual.as_ref() != expected.as_slice() {
-                    eprintln!("error: output checksum mismatch after in-place apply");
-                    return 1;
-                }
-            }
-            Err(e) => {
-                eprintln!("error: failed to hash output: {e}");
-                return 1;
-            }
-        }
-    }
-    0
-}
-
-fn checksum_file(path: &std::path::Path, algo: ChecksumAlgo) -> std::io::Result<Box<[u8]>> {
-    use std::io::Read;
-    let mut h = algo.instantiate();
-    let mut r = std::io::BufReader::new(File::open(path)?);
-    let mut buf = vec![0u8; 1 << 20];
-    loop {
-        let n = r.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        rxdelta::checksum::Checksum::update(&mut h, &buf[..n]);
-    }
-    Ok(rxdelta::checksum::Checksum::digest(h))
 }
 
 fn apply_and_flush(

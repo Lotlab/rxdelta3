@@ -7,12 +7,14 @@ pub mod varint;
 pub use checksum::{
     Blake3, BoxedChecksum, Checksum, ChecksumAlgo, HashingWriter, Md5, Sha256, encode_hex,
 };
-pub use errors::{Error, Result};
 pub use decoder::in_place;
 pub use decoder::in_place::{
-    DEFAULT_IN_PLACE_THRESHOLD, InPlaceStats, Layout, WindowLayout, apply_paths_in_place,
-    apply_paths_in_place_with_threshold, scan_layout,
+    DEFAULT_IN_PLACE_THRESHOLD, IN_PLACE_JOURNAL_SUFFIX, InPlaceChecksums, InPlaceOutcome,
+    InPlaceStats, Layout, WindowLayout, apply_paths_in_place, apply_paths_in_place_verified,
+    apply_paths_in_place_verified_with_threshold, apply_paths_in_place_with_threshold,
+    recover_in_place_journal, scan_layout,
 };
+pub use errors::{Error, Result};
 
 use std::io::Write;
 use std::path::Path;

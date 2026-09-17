@@ -15,6 +15,13 @@ pub enum Error {
         expected: String,
         actual: String,
     },
+    /// Phase-2 of an in-place apply failed and the journal rollback could not
+    /// restore the source. The journal file is left behind so a later run
+    /// (or [`crate::in_place::recover_in_place_journal`]) can retry recovery.
+    InPlaceRollback {
+        reason: String,
+        journal: String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -38,6 +45,12 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "file checksum mismatch ({phase}): expected {expected}, got {actual} ({algo})"
+                )
+            }
+            Error::InPlaceRollback { reason, journal } => {
+                write!(
+                    f,
+                    "in-place rollback incomplete: {reason}; original blocks preserved in {journal}"
                 )
             }
         }

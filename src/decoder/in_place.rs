@@ -7,24 +7,36 @@
 //! the cross-window read-after-write hazard where a window's COPY reads bytes
 //! that an earlier window's write already overwrote.
 //!
+//! Crash safety for the write-back phase relies on a small on-disk journal:
+//! before the source is touched, the original bytes of every range that will
+//! be overwritten or truncated are streamed into
+//! `<source>.xdelta-journal.tmp` and fsync'd. If a write fails (I/O error,
+//! process kill, power loss) the journal replays those ranges and restores
+//! the original length. A stale journal left by a crashed run is replayed
+//! automatically at the start of the next apply, and can also be replayed
+//! manually with [`recover_in_place_journal`]. The journal is deleted once
+//! the source has been fully written and synced.
+//!
 //! Window decoding is shared with `decode_one_window`; this
 //! module only adds the layout scan, pure-copy detection, two-phase write-back
-//! and the temp-rename threshold fallback.
+//! with journal rollback, the verified (`expect_before`/`expect_after`)
+//! pre-checks and the temp-rename threshold fallback.
 
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::address::AddrCache;
-use super::code_table::{CodeTable, COPY, NOOP};
+use super::code_table::{COPY, CodeTable, NOOP};
 use super::decode_one_window;
-use super::header::{parse_header, SecondaryId};
+use super::header::{SecondaryId, parse_header};
 use super::secondary::SecondaryDecoder;
-use super::window::{parse_window, Window, VCD_SOURCE};
+use super::window::{VCD_SOURCE, Window, parse_window};
+use crate::ApplyOptions;
+use crate::checksum::{Checksum, ChecksumAlgo};
 use crate::errors::{Error, Result};
 use crate::io::MappedFile;
 use crate::varint::read_usize;
-use crate::ApplyOptions;
 
 /// Default cap on total changed-window bytes before falling back to a full
 /// temp-file rewrite. Bounded memory is a hard requirement, so the in-place
@@ -140,7 +152,10 @@ fn is_pure_copy(ct: &CodeTable, delta: &[u8], w: &Window, target_offset: u64) ->
     if w.source_seg_pos as u64 != target_offset {
         return false;
     }
-    let Some(&op) = delta.get(w.inst_start..w.addr_start).and_then(|s| s.first()) else {
+    let Some(&op) = delta
+        .get(w.inst_start..w.addr_start)
+        .and_then(|s| s.first())
+    else {
         return false;
     };
     let entry = &ct.entries[op as usize];
@@ -175,7 +190,11 @@ fn is_pure_copy(ct: &CodeTable, delta: &[u8], w: &Window, target_offset: u64) ->
 
 /// Apply a delta to the source file in place, rewriting only the changed
 /// window slots. Uses [`DEFAULT_IN_PLACE_THRESHOLD`] as the buffering cap.
-pub fn apply_paths_in_place(source: &Path, delta: &Path, opts: &ApplyOptions) -> Result<InPlaceStats> {
+pub fn apply_paths_in_place(
+    source: &Path,
+    delta: &Path,
+    opts: &ApplyOptions,
+) -> Result<InPlaceStats> {
     apply_paths_in_place_with_threshold(source, delta, opts, DEFAULT_IN_PLACE_THRESHOLD)
 }
 
@@ -188,6 +207,10 @@ pub fn apply_paths_in_place_with_threshold(
     opts: &ApplyOptions,
     threshold: u64,
 ) -> Result<InPlaceStats> {
+    // A stale journal means a previous run died mid-write. Replay it first so
+    // this apply starts from the intact original instead of a torn file.
+    recover_in_place_journal(source)?;
+
     let delta_map = MappedFile::open(delta)?;
     let delta_bytes = delta_map.as_bytes();
     let layout = scan_layout(delta_bytes, opts.max_window_size)?;
@@ -232,16 +255,9 @@ pub fn apply_paths_in_place_with_threshold(
         changed
     };
 
-    // Phase 2: resize, then write the changed slots through a writable handle.
-    let mut src_file = OpenOptions::new().read(true).write(true).open(source)?;
-    if src_file.metadata()?.len() != layout.target_len {
-        src_file.set_len(layout.target_len)?;
-    }
-    for (off, bytes) in &changed {
-        src_file.seek(SeekFrom::Start(*off))?;
-        src_file.write_all(bytes)?;
-    }
-    src_file.flush()?;
+    // Phase 2: journal the original blocks, then write the changed slots.
+    // Any write failure rolls the source back from the journal.
+    commit_changed_slots(source, layout.target_len, &changed)?;
 
     Ok(InPlaceStats {
         windows: layout.windows.len() as u64,
@@ -257,13 +273,25 @@ pub fn apply_paths_in_place_with_threshold(
 fn apply_via_temp(source: &Path, delta: &Path, opts: &ApplyOptions) -> Result<InPlaceStats> {
     let tmp = temp_path(source);
     let stats = {
-        let file = File::create(&tmp)?;
-        let mut w = BufWriter::with_capacity(1 << 20, file);
-        let s = crate::apply_paths(Some(source), delta, &mut w, opts)?;
-        w.flush()?;
-        s
+        let result = (|| {
+            let file = File::create(&tmp)?;
+            let mut w = BufWriter::with_capacity(1 << 20, file);
+            let s = crate::apply_paths(Some(source), delta, &mut w, opts)?;
+            w.flush()?;
+            Ok::<_, Error>(s)
+        })();
+        match result {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        }
     };
-    std::fs::rename(&tmp, source)?;
+    if let Err(e) = std::fs::rename(&tmp, source) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     Ok(InPlaceStats {
         windows: stats.windows,
         written_windows: stats.windows,
@@ -277,6 +305,516 @@ fn temp_path(source: &Path) -> PathBuf {
     let mut s = source.as_os_str().to_os_string();
     s.push(".xdelta-inplace.tmp");
     PathBuf::from(s)
+}
+
+// ---------------------------------------------------------------------------
+// Write-back journal: record-then-restore for the in-place write phase.
+// ---------------------------------------------------------------------------
+
+/// Suffix for the write-back journal living next to the source file.
+pub const IN_PLACE_JOURNAL_SUFFIX: &str = ".xdelta-journal.tmp";
+
+/// Journal file magic (`XDJRNAL` + version byte 1).
+const JOURNAL_MAGIC: [u8; 8] = *b"XDJRNAL\x01";
+
+/// Streaming chunk size for journal record bodies (bounds extra RAM to 1 MiB).
+const JOURNAL_CHUNK: u64 = 1 << 20;
+
+fn journal_path(source: &Path) -> PathBuf {
+    let mut s = source.as_os_str().to_os_string();
+    s.push(IN_PLACE_JOURNAL_SUFFIX);
+    PathBuf::from(s)
+}
+
+fn write_u64(f: &mut File, v: u64) -> Result<()> {
+    f.write_all(&v.to_le_bytes()).map_err(Error::from)
+}
+
+fn read_u64(r: &mut impl Read) -> std::io::Result<Option<u64>> {
+    let mut buf = [0u8; 8];
+    let mut got = 0usize;
+    while got < 8 {
+        match r.read(&mut buf[got..]) {
+            Ok(0) => {
+                // Clean EOF exactly on a record boundary ends the journal;
+                // a short read mid-record means the journal write was torn
+                // (crash before fsync), in which case the source was never
+                // touched and the complete prefix replays harmlessly.
+                return Ok(None);
+            }
+            Ok(n) => got += n,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(u64::from_le_bytes(buf)))
+}
+
+/// Copy `len` bytes at `offset` from `reader` into the journal as one record.
+/// Records that fall completely past EOF (file-growth region) carry no
+/// original data and are skipped; the rollback truncation restores those.
+fn append_journal_record(
+    journal: &mut File,
+    reader: &mut File,
+    offset: u64,
+    len: u64,
+    orig_len: u64,
+) -> Result<()> {
+    let start = offset.min(orig_len);
+    let end = offset.saturating_add(len).min(orig_len);
+    if end <= start {
+        return Ok(());
+    }
+    let span = end - start;
+    write_u64(journal, start)?;
+    write_u64(journal, span)?;
+    reader.seek(SeekFrom::Start(start))?;
+    let mut buf = vec![0u8; JOURNAL_CHUNK as usize];
+    let mut remaining = span;
+    while remaining > 0 {
+        let n = remaining.min(JOURNAL_CHUNK) as usize;
+        reader.read_exact(&mut buf[..n])?;
+        journal.write_all(&buf[..n])?;
+        remaining -= n as u64;
+    }
+    Ok(())
+}
+
+/// Replay the journal at `<source>.xdelta-journal.tmp`, restoring the
+/// original block contents and file length. Returns `Ok(true)` when a journal
+/// was found and replayed, `Ok(false)` when there was nothing to recover.
+/// The journal is deleted after a successful replay. When the replay itself
+/// fails an [`Error::InPlaceRollback`] is returned and the journal is kept
+/// for a later retry.
+///
+/// This runs automatically at the start of every in-place apply (covering a
+/// previous crash); call it directly to recover without applying anything.
+pub fn recover_in_place_journal(source: &Path) -> Result<bool> {
+    let path = journal_path(source);
+    let mut journal = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let replay: Result<()> = (|| {
+        let mut magic = [0u8; 8];
+        journal.read_exact(&mut magic)?;
+        if magic != JOURNAL_MAGIC {
+            return Err(Error::Format("in-place journal has a bad magic"));
+        }
+        let orig_len =
+            read_u64(&mut journal)?.ok_or(Error::Format("in-place journal is truncated"))?;
+        let mut target = OpenOptions::new().read(true).write(true).open(source)?;
+        // Replay every complete record; a torn tail (crash mid-journal-write)
+        // simply stops the loop — the source was untouched in that case.
+        while let Some(off) = read_u64(&mut journal)? {
+            let len = match read_u64(&mut journal)? {
+                Some(l) => l,
+                None => break,
+            };
+            let mut remaining = len;
+            target.seek(SeekFrom::Start(off))?;
+            let mut buf = vec![0u8; JOURNAL_CHUNK as usize];
+            while remaining > 0 {
+                let n = remaining.min(JOURNAL_CHUNK) as usize;
+                let mut got = 0usize;
+                while got < n {
+                    match journal.read(&mut buf[got..n])? {
+                        0 => break,
+                        k => got += k,
+                    }
+                }
+                if got == 0 {
+                    break;
+                }
+                target.write_all(&buf[..got])?;
+                remaining -= got as u64;
+            }
+            if remaining > 0 {
+                break;
+            }
+        }
+        if target.metadata()?.len() != orig_len {
+            target.set_len(orig_len)?;
+        }
+        target.flush()?;
+        target.sync_all()?;
+        Ok(())
+    })();
+    match replay {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&path);
+            Ok(true)
+        }
+        Err(e) => Err(Error::InPlaceRollback {
+            reason: e.to_string(),
+            journal: path.display().to_string(),
+        }),
+    }
+}
+
+/// Persist the original blocks of every soon-to-be-modified range into the
+/// journal next to `source` and fsync it. Returns the journal path. Step 1 of
+/// [`commit_changed_slots`]; factored out so tests can plant a journal and
+/// simulate a torn write before calling [`recover_in_place_journal`].
+fn write_journal(
+    source: &Path,
+    orig_len: u64,
+    target_len: u64,
+    changed: &[(u64, Vec<u8>)],
+) -> Result<PathBuf> {
+    let path = journal_path(source);
+    let mut reader = File::open(source)?;
+    let mut journal = File::create(&path)?;
+    journal.write_all(&JOURNAL_MAGIC)?;
+    write_u64(&mut journal, orig_len)?;
+    for (off, bytes) in changed {
+        append_journal_record(
+            &mut journal,
+            &mut reader,
+            *off,
+            bytes.len() as u64,
+            orig_len,
+        )?;
+    }
+    // Shrinking truncates `[target_len, orig_len)` away without ever
+    // writing it, so the tail needs its own backup records.
+    if orig_len > target_len {
+        let mut off = target_len;
+        while off < orig_len {
+            let n = (orig_len - off).min(JOURNAL_CHUNK);
+            append_journal_record(&mut journal, &mut reader, off, n, orig_len)?;
+            off += n;
+        }
+    }
+    journal.flush()?;
+    journal.sync_all()?;
+    Ok(path)
+}
+
+/// Phase 2 of the in-place apply: persist the original blocks to the journal,
+/// fsync it, then resize and overwrite the changed slots. Any failure after
+/// the journal is durable triggers a rollback replay before the error is
+/// returned, so the source keeps either its old or its new content — never a
+/// torn mix.
+fn commit_changed_slots(source: &Path, target_len: u64, changed: &[(u64, Vec<u8>)]) -> Result<()> {
+    let orig_len = std::fs::metadata(source)?.len();
+    if changed.is_empty() && orig_len == target_len {
+        return Ok(());
+    }
+    // Step 1: record original blocks. The journal fsync inside is the point
+    // of no return — nothing that follows may mutate the source before it.
+    let path = write_journal(source, orig_len, target_len, changed)?;
+    // Step 2: mutate. Grow first (writes need the space), shrink last (so a
+    // failure before the truncate leaves the tail recoverable in place too).
+    let mutate: Result<()> = (|| {
+        let mut f = OpenOptions::new().read(true).write(true).open(source)?;
+        if target_len > orig_len {
+            f.set_len(target_len)?;
+        }
+        for (off, bytes) in changed {
+            f.seek(SeekFrom::Start(*off))?;
+            f.write_all(bytes)?;
+        }
+        if f.metadata()?.len() != target_len {
+            f.set_len(target_len)?;
+        }
+        f.flush()?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    match mutate {
+        Ok(()) => {
+            // Best effort: the content is already durable; a leftover journal
+            // only costs a redundant recover-then-reapply on the next run.
+            let _ = std::fs::remove_file(&path);
+            Ok(())
+        }
+        Err(e) => {
+            // Roll back to the journaled original, then report the failure
+            // that caused it. `recover_in_place_journal` deletes the journal
+            // on success and keeps it (with an `InPlaceRollback` error) when
+            // the replay itself breaks.
+            match recover_in_place_journal(source) {
+                Ok(_) => Err(e),
+                Err(r) => Err(Error::InPlaceRollback {
+                    reason: format!("write failed ({e}) and rollback failed ({r})"),
+                    journal: path.display().to_string(),
+                }),
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Verified in-place apply: `expect_before` / `expect_after` file checksums.
+// ---------------------------------------------------------------------------
+
+/// File-level checksums for a verified in-place apply.
+#[derive(Debug, Clone, Default)]
+pub struct InPlaceChecksums {
+    /// Hash of the source before any write (`None` when it was not needed).
+    pub before: Option<Box<[u8]>>,
+    /// Hash of the bytes written to the source.
+    pub after: Option<Box<[u8]>>,
+}
+
+/// Outcome of [`apply_paths_in_place_verified`].
+#[derive(Debug)]
+pub enum InPlaceOutcome {
+    Applied {
+        stats: InPlaceStats,
+        checksums: InPlaceChecksums,
+    },
+    Skipped {
+        source_checksum: Box<[u8]>,
+    },
+}
+
+/// Verified in-place apply using [`DEFAULT_IN_PLACE_THRESHOLD`].
+///
+/// Unlike the plain apply, `expect_after` is checked *before* the source is
+/// touched: the output hash is reconstructed from the decoded windows plus
+/// the untouched source bytes, so a mismatch fails with the file still
+/// byte-identical to the original (no journal replay needed). Write-phase
+/// I/O failures still roll back via the journal (see [`commit_changed_slots`]).
+pub fn apply_paths_in_place_verified(
+    source: &Path,
+    delta: &Path,
+    opts: &ApplyOptions,
+    algo: ChecksumAlgo,
+    expect_before: Option<&[u8]>,
+    expect_after: Option<&[u8]>,
+) -> Result<InPlaceOutcome> {
+    apply_paths_in_place_verified_with_threshold(
+        source,
+        delta,
+        opts,
+        algo,
+        expect_before,
+        expect_after,
+        DEFAULT_IN_PLACE_THRESHOLD,
+    )
+}
+
+/// Verified in-place apply with an explicit cap on total changed-window bytes.
+/// Over the cap the patch goes through a temp file + rename, and the rename
+/// only happens after the verified output hash matches.
+pub fn apply_paths_in_place_verified_with_threshold(
+    source: &Path,
+    delta: &Path,
+    opts: &ApplyOptions,
+    algo: ChecksumAlgo,
+    expect_before: Option<&[u8]>,
+    expect_after: Option<&[u8]>,
+    threshold: u64,
+) -> Result<InPlaceOutcome> {
+    recover_in_place_journal(source)?;
+
+    let delta_map = MappedFile::open(delta)?;
+    let delta_bytes = delta_map.as_bytes();
+    let layout = scan_layout(delta_bytes, opts.max_window_size)?;
+
+    if layout.changed_bytes > threshold {
+        return apply_via_temp_verified(source, delta, opts, algo, expect_before, expect_after);
+    }
+
+    // Phase 1: decode every changed window while the source is untouched.
+    // The source hash (skip / `expect_before` checks) runs BEFORE any decode
+    // so an already-patched source returns without decoding a single window.
+    // The output hash is accumulated INLINE in the same decode loop — each
+    // window is hashed the moment it is produced — instead of a second walk
+    // over the decoded buffers. Either way nothing is written before both
+    // hashes are compared.
+    let changed = {
+        let src_map = MappedFile::open(source)?;
+        let src_bytes = src_map.as_bytes();
+
+        // Source hash: feeds the `expect_before` check and the idempotent
+        // skip check against `expect_after`. A source whose length differs
+        // from the target provably cannot be skipped, so skip that hashing
+        // pass (mirrors `apply_paths_verified`).
+        let hash_needed = expect_before.is_some()
+            || (opts.idempotent_skip
+                && expect_after.is_some()
+                && src_bytes.len() as u64 == layout.target_len);
+        let source_hash: Option<Box<[u8]>> = if hash_needed {
+            let mut h = algo.instantiate();
+            h.update(src_bytes);
+            Some(h.digest())
+        } else {
+            None
+        };
+
+        if let (Some(src), Some(after)) = (&source_hash, expect_after)
+            && opts.idempotent_skip
+            && src.as_ref() == after
+        {
+            return Ok(InPlaceOutcome::Skipped {
+                source_checksum: src.clone(),
+            });
+        }
+
+        if let (Some(src), Some(before)) = (&source_hash, expect_before)
+            && src.as_ref() != before
+        {
+            return Err(Error::FileChecksumMismatch {
+                phase: "source",
+                algo: algo.name(),
+                expected: crate::encode_hex(before),
+                actual: crate::encode_hex(src),
+            });
+        }
+
+        let mut target = Vec::new();
+        let mut data_buf = Vec::new();
+        let mut inst_buf = Vec::new();
+        let mut addr_buf = Vec::new();
+        let mut secondary = SecondaryDecoder::new();
+        let mut cache = AddrCache::new(layout.code_table.s_near, layout.code_table.s_same);
+        let mut changed: Vec<(u64, Vec<u8>)> = Vec::with_capacity(layout.changed_windows);
+        let mut out_hash = expect_after.is_some().then(|| algo.instantiate());
+        for wl in &layout.windows {
+            // Pure-copy slots hash straight from the source bytes (borrowed
+            // mmap slice, no decode and no copy); this also bounds-checks
+            // the source before anything is written.
+            if wl.pure_copy {
+                if let Some(h) = out_hash.as_mut() {
+                    let (off, end) = window_source_range(
+                        wl.target_offset,
+                        wl.win.target_len as u64,
+                        src_bytes.len(),
+                    )?;
+                    h.update(&src_bytes[off..end]);
+                }
+                continue;
+            }
+            decode_one_window(
+                delta_bytes,
+                Some(src_bytes),
+                &wl.win,
+                &layout.code_table,
+                &mut cache,
+                opts,
+                &mut secondary,
+                &mut data_buf,
+                &mut inst_buf,
+                &mut addr_buf,
+                &mut target,
+            )?;
+            // Hash the bytes while they are still hot from the decoder, then
+            // retain a copy for the Phase 2 write-back.
+            if let Some(h) = out_hash.as_mut() {
+                h.update(&target);
+            }
+            changed.push((wl.target_offset, target.clone()));
+        }
+        let output_digest = out_hash.map(|h| h.digest());
+
+        if let (Some(digest), Some(after)) = (&output_digest, expect_after)
+            && digest.as_ref() != after
+        {
+            return Err(Error::FileChecksumMismatch {
+                phase: "output",
+                algo: algo.name(),
+                expected: crate::encode_hex(after),
+                actual: crate::encode_hex(digest),
+            });
+        }
+
+        (changed, source_hash, output_digest)
+    };
+    let (changed, source_hash, output_digest) = changed;
+
+    // Phase 2: journal + write-back with rollback on I/O failure.
+    commit_changed_slots(source, layout.target_len, &changed)?;
+
+    Ok(InPlaceOutcome::Applied {
+        stats: InPlaceStats {
+            windows: layout.windows.len() as u64,
+            written_windows: changed.len() as u64,
+            written_bytes: changed.iter().map(|(_, b)| b.len() as u64).sum(),
+            skipped_windows: layout.skipped_windows as u64,
+            target_len: layout.target_len,
+        },
+        checksums: InPlaceChecksums {
+            before: source_hash,
+            after: output_digest,
+        },
+    })
+}
+
+/// Bounds-checked source slice for a pure-copy window in the output pre-check.
+/// Pure-copy windows reproduce `[target_offset, target_offset + len)` from the
+/// source, so an out-of-range source is a corrupt input, not a writable one.
+fn window_source_range(target_offset: u64, len: u64, src_len: usize) -> Result<(usize, usize)> {
+    let off: usize = target_offset
+        .try_into()
+        .map_err(|_| Error::Format("source segment out of range"))?;
+    let end = off
+        .checked_add(len as usize)
+        .ok_or(Error::Format("source segment out of range"))?;
+    if end > src_len {
+        return Err(Error::Format("source segment out of range"));
+    }
+    Ok((off, end))
+}
+
+/// Threshold fallback for the verified apply: render to a temp file, verify
+/// the output hash, and rename over the source only on success. The source
+/// is never modified on failure, and the temp file is removed.
+fn apply_via_temp_verified(
+    source: &Path,
+    delta: &Path,
+    opts: &ApplyOptions,
+    algo: ChecksumAlgo,
+    expect_before: Option<&[u8]>,
+    expect_after: Option<&[u8]>,
+) -> Result<InPlaceOutcome> {
+    let tmp = temp_path(source);
+    let outcome = (|| {
+        let file = File::create(&tmp)?;
+        let mut w = BufWriter::with_capacity(1 << 20, file);
+        let outcome = crate::apply_paths_verified(
+            Some(source),
+            delta,
+            &mut w,
+            algo,
+            expect_before,
+            expect_after,
+            opts,
+        )?;
+        w.flush()?;
+        Ok::<_, Error>(outcome)
+    })();
+    match outcome {
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+        Ok(crate::ApplyOutcome::Skipped { source_checksum }) => {
+            let _ = std::fs::remove_file(&tmp);
+            Ok(InPlaceOutcome::Skipped { source_checksum })
+        }
+        Ok(crate::ApplyOutcome::Applied { stats, checksums }) => {
+            if let Err(e) = std::fs::rename(&tmp, source) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+            Ok(InPlaceOutcome::Applied {
+                stats: InPlaceStats {
+                    windows: stats.windows,
+                    written_windows: stats.windows,
+                    written_bytes: stats.target_len,
+                    skipped_windows: 0,
+                    target_len: stats.target_len,
+                },
+                checksums: InPlaceChecksums {
+                    before: checksums.before,
+                    after: checksums.after,
+                },
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -505,8 +1043,13 @@ mod tests {
         std::fs::write(&dl, d).unwrap();
 
         apply_paths_in_place(&src, &dl, &ApplyOptions::default()).unwrap();
-        let expected: Vec<u8> = [vec![b'A'; 16], vec![b'B'; 16], vec![b'C'; 16], vec![b'D'; 16]]
-            .concat();
+        let expected: Vec<u8> = [
+            vec![b'A'; 16],
+            vec![b'B'; 16],
+            vec![b'C'; 16],
+            vec![b'D'; 16],
+        ]
+        .concat();
         assert_eq!(read_file(&src), expected);
     }
 
@@ -591,5 +1134,275 @@ mod tests {
         assert!(matches!(err, Error::ChecksumMismatch { .. }));
         // Phase-1 failure: no writes happened, source unchanged.
         assert_eq!(read_file(&src), source_bytes());
+    }
+
+    // -- journal rollback + verified pre-checks --------------------------------
+
+    use crate::checksum::{Checksum, ChecksumAlgo};
+    use std::fs::OpenOptions;
+
+    fn md5(data: &[u8]) -> Vec<u8> {
+        let mut h = ChecksumAlgo::Md5.instantiate();
+        h.update(data);
+        h.digest().to_vec()
+    }
+
+    fn expected_output() -> Vec<u8> {
+        [
+            vec![b'x'; 16],
+            vec![b'B'; 16],
+            vec![b'A'; 16],
+            vec![b'D'; 16],
+        ]
+        .concat()
+    }
+
+    fn journal_for(src: &Path) -> PathBuf {
+        let mut s = src.as_os_str().to_os_string();
+        s.push(IN_PLACE_JOURNAL_SUFFIX);
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn verified_output_mismatch_leaves_source_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.dat");
+        let dl = dir.path().join("patch.delta");
+        std::fs::write(&src, source_bytes()).unwrap();
+        std::fs::write(&dl, reverse_read_delta()).unwrap();
+
+        let opts = ApplyOptions::default();
+        let before = md5(&source_bytes());
+        let err = apply_paths_in_place_verified(
+            &src,
+            &dl,
+            &opts,
+            ChecksumAlgo::Md5,
+            Some(&before),
+            Some(&md5(b"definitely not the target")),
+        )
+        .unwrap_err();
+        match err {
+            Error::FileChecksumMismatch { phase, .. } => assert_eq!(phase, "output"),
+            e => panic!("wrong error: {e}"),
+        }
+        // Pre-write check: nothing was journaled, nothing was written.
+        assert_eq!(read_file(&src), source_bytes());
+        assert!(!journal_for(&src).exists());
+    }
+
+    #[test]
+    fn verified_source_mismatch_leaves_source_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.dat");
+        let dl = dir.path().join("patch.delta");
+        std::fs::write(&src, source_bytes()).unwrap();
+        std::fs::write(&dl, reverse_read_delta()).unwrap();
+
+        let err = apply_paths_in_place_verified(
+            &src,
+            &dl,
+            &ApplyOptions::default(),
+            ChecksumAlgo::Md5,
+            Some(&md5(b"wrong source")),
+            Some(&md5(&expected_output())),
+        )
+        .unwrap_err();
+        match err {
+            Error::FileChecksumMismatch { phase, .. } => assert_eq!(phase, "source"),
+            e => panic!("wrong error: {e}"),
+        }
+        assert_eq!(read_file(&src), source_bytes());
+        assert!(!journal_for(&src).exists());
+    }
+
+    #[test]
+    fn verified_success_returns_checksums_and_cleans_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.dat");
+        let dl = dir.path().join("patch.delta");
+        std::fs::write(&src, source_bytes()).unwrap();
+        std::fs::write(&dl, reverse_read_delta()).unwrap();
+
+        let outcome = apply_paths_in_place_verified(
+            &src,
+            &dl,
+            &ApplyOptions::default(),
+            ChecksumAlgo::Md5,
+            Some(&md5(&source_bytes())),
+            Some(&md5(&expected_output())),
+        )
+        .unwrap();
+        match outcome {
+            InPlaceOutcome::Applied { stats, checksums } => {
+                assert_eq!(stats.written_windows, 2);
+                assert_eq!(
+                    checksums.before.as_deref(),
+                    Some(md5(&source_bytes()).as_slice())
+                );
+                assert_eq!(
+                    checksums.after.as_deref(),
+                    Some(md5(&expected_output()).as_slice())
+                );
+            }
+            InPlaceOutcome::Skipped { .. } => panic!("should have applied"),
+        }
+        assert_eq!(read_file(&src), expected_output());
+        assert!(!journal_for(&src).exists());
+    }
+
+    #[test]
+    fn verified_skips_already_patched_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.dat");
+        let dl = dir.path().join("patch.delta");
+        std::fs::write(&src, expected_output()).unwrap();
+        std::fs::write(&dl, reverse_read_delta()).unwrap();
+
+        // Source already equals the target: no write, no journal.
+        let outcome = apply_paths_in_place_verified(
+            &src,
+            &dl,
+            &ApplyOptions::default(),
+            ChecksumAlgo::Md5,
+            None,
+            Some(&md5(&expected_output())),
+        )
+        .unwrap();
+        match outcome {
+            InPlaceOutcome::Skipped { source_checksum } => {
+                assert_eq!(source_checksum.as_ref(), md5(&expected_output()).as_slice());
+            }
+            InPlaceOutcome::Applied { .. } => panic!("should have skipped"),
+        }
+        assert_eq!(read_file(&src), expected_output());
+        assert!(!journal_for(&src).exists());
+    }
+
+    #[test]
+    fn journal_recovery_restores_torn_shrink() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.dat");
+        let original = source_bytes(); // 64 bytes
+        std::fs::write(&src, &original).unwrap();
+
+        // Plant the journal for a shrink to 16 bytes, then simulate a torn
+        // write: head overwritten, tail truncated away.
+        let changed = vec![(0u64, vec![b'x'; 16])];
+        write_journal(&src, original.len() as u64, 16, &changed).unwrap();
+        assert!(journal_for(&src).exists());
+        {
+            let mut f = OpenOptions::new().write(true).open(&src).unwrap();
+            f.write_all(&[b'x'; 16]).unwrap();
+            f.set_len(16).unwrap();
+            f.sync_all().unwrap();
+        }
+        assert_eq!(read_file(&src), vec![b'x'; 16]);
+
+        assert!(recover_in_place_journal(&src).unwrap());
+        assert_eq!(read_file(&src), original);
+        // Journal consumed; nothing left to recover.
+        assert!(!journal_for(&src).exists());
+        assert!(!recover_in_place_journal(&src).unwrap());
+    }
+
+    #[test]
+    fn journal_recovery_restores_torn_grow() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.dat");
+        let original = vec![b'A'; 16];
+        std::fs::write(&src, &original).unwrap();
+
+        // Grow 16 -> 48 with two new blocks; tear after the first one.
+        let changed = vec![(16u64, vec![b'C'; 16]), (32u64, vec![b'D'; 16])];
+        write_journal(&src, original.len() as u64, 48, &changed).unwrap();
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&src)
+                .unwrap();
+            f.set_len(48).unwrap();
+            f.seek(SeekFrom::Start(16)).unwrap();
+            f.write_all(&[b'C'; 16]).unwrap();
+            f.sync_all().unwrap();
+        }
+        assert_eq!(std::fs::metadata(&src).unwrap().len(), 48);
+
+        assert!(recover_in_place_journal(&src).unwrap());
+        assert_eq!(read_file(&src), original);
+    }
+
+    #[test]
+    fn stale_journal_auto_recovered_on_next_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.dat");
+        let dl = dir.path().join("patch.delta");
+        std::fs::write(&src, source_bytes()).unwrap();
+        std::fs::write(&dl, reverse_read_delta()).unwrap();
+
+        // Crash simulation: journal the real first changed block, then tear
+        // the head of the file and leave the journal behind.
+        write_journal(&src, 64, 64, &[(0u64, vec![b'x'; 16])]).unwrap();
+        std::fs::write(
+            &src,
+            [vec![0u8; 16], source_bytes()[16..].to_vec()].concat(),
+        )
+        .unwrap();
+        assert_ne!(read_file(&src), source_bytes());
+
+        // The next apply replays the stale journal, then patches cleanly.
+        let stats = apply_paths_in_place(&src, &dl, &ApplyOptions::default()).unwrap();
+        assert_eq!(stats.written_windows, 2);
+        assert_eq!(read_file(&src), expected_output());
+        assert!(!journal_for(&src).exists());
+    }
+
+    #[test]
+    fn threshold_fallback_verified_mismatch_touches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.dat");
+        let dl = dir.path().join("patch.delta");
+        std::fs::write(&src, source_bytes()).unwrap();
+        std::fs::write(&dl, reverse_read_delta()).unwrap();
+
+        let err = apply_paths_in_place_verified_with_threshold(
+            &src,
+            &dl,
+            &ApplyOptions::default(),
+            ChecksumAlgo::Md5,
+            None,
+            Some(&md5(b"wrong")),
+            0, // force the temp-file fallback
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::FileChecksumMismatch { .. }));
+        assert_eq!(read_file(&src), source_bytes());
+        let mut tmp = src.as_os_str().to_os_string();
+        tmp.push(".xdelta-inplace.tmp");
+        assert!(!Path::new(&tmp).exists());
+        assert!(!journal_for(&src).exists());
+    }
+
+    #[test]
+    fn threshold_fallback_verified_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.dat");
+        let dl = dir.path().join("patch.delta");
+        std::fs::write(&src, source_bytes()).unwrap();
+        std::fs::write(&dl, reverse_read_delta()).unwrap();
+
+        let outcome = apply_paths_in_place_verified_with_threshold(
+            &src,
+            &dl,
+            &ApplyOptions::default(),
+            ChecksumAlgo::Md5,
+            Some(&md5(&source_bytes())),
+            Some(&md5(&expected_output())),
+            0, // force the temp-file fallback
+        )
+        .unwrap();
+        assert!(matches!(outcome, InPlaceOutcome::Applied { .. }));
+        assert_eq!(read_file(&src), expected_output());
     }
 }
