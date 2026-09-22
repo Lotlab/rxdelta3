@@ -3,6 +3,7 @@ name = "rxdelta"
 version = "0.2.2"
 edition = "2024"
 description = "High-speed VCDIFF (RFC 3284) patch application library and CLI, compatible with xdelta3"
+license = "MIT OR Apache-2.0"
 
 [workspace]
 members = ["xdelta3-wrap", "xdelta3-installer"]

@@ -3,6 +3,7 @@ name = "xdelta3-wrap"
 version = "0.1.0"
 edition = "2021"
 description = "Drop-in replacement for XDelta3WrapFactory.dll (FFXIV V3 launcher), built on rxdelta"
+license = "MIT OR Apache-2.0"
 
 [lib]
 name = "xdelta3_wrap"

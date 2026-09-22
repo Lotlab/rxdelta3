@@ -249,3 +249,7 @@ XDELTA3=/path/to/xdelta3 BIN=target/release/xdelta tests/crosscheck.sh
 ```
 
 `cargo-fuzz` target lives in `fuzz/` (requires nightly + `cargo fuzz`).
+
+## License
+
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE) at your option.
